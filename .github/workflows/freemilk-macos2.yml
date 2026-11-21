@@ -1,28 +1,29 @@
-name: FreeMilk macOS Cloud Session
+name: FreeMilk macOS Session
 
 on:
   workflow_dispatch:
     inputs:
       session_hours:
-        description: Session length (the runner is temporary)
+        description: "How long to keep the temporary session alive"
         required: true
         type: choice
-        default: '2'
+        default: "2"
         options:
-          - '1'
-          - '2'
-          - '3'
-          - '4'
-          - '5'
-          - '6'
-          - '7'
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
 
 permissions:
   contents: read
 
+concurrency:
+  group: freemilk-macos-session
+  cancel-in-progress: true
+
 jobs:
   freemilk-mac:
-    # Standard Apple-Silicon macOS runner.
     runs-on: macos-26
     timeout-minutes: 360
 
@@ -51,7 +52,6 @@ jobs:
             "https://www.freemilk.ai/download/mac" \
             --output "$DMG"
 
-          echo "Checking downloaded file..."
           file "$DMG"
           hdiutil attach "$DMG" -readonly -nobrowse -quiet -mountpoint "$MOUNT"
 
@@ -61,54 +61,112 @@ jobs:
           if [[ -n "$APP_PATH" ]]; then
             APP_NAME="$(basename "$APP_PATH")"
             DEST="/Applications/$APP_NAME"
-            echo "Found app bundle: $APP_NAME"
             sudo ditto "$APP_PATH" "$DEST"
             echo "FREEMILK_APP_PATH=$DEST" >> "$GITHUB_ENV"
           elif [[ -n "$PKG_PATH" ]]; then
-            echo "Found installer package: $(basename "$PKG_PATH")"
             sudo installer -pkg "$PKG_PATH" -target /
             APP_PATH="$(find /Applications -maxdepth 3 -type d \( -iname '*freemilk*.app' -o -iname '*milq*.app' \) -print -quit || true)"
             if [[ -z "$APP_PATH" ]]; then
-              echo "The package installed, but the app bundle was not found in /Applications."
+              echo "Installer ran, but FreeMilk.app was not found."
               find /Applications -maxdepth 2 -type d -name '*.app' -print | tail -30
+              hdiutil detach "$MOUNT" -quiet || true
               exit 1
             fi
             echo "FREEMILK_APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
           else
-            echo "No .app or .pkg installer was found in the official DMG. Contents:"
+            echo "No .app or .pkg was found in the downloaded DMG."
             find "$MOUNT" -maxdepth 4 -print | head -100
             hdiutil detach "$MOUNT" -quiet || true
             exit 1
           fi
 
           hdiutil detach "$MOUNT" -quiet
-          echo "FreeMilk installer was copied/installed."
+          echo "FreeMilk installation step completed."
 
-      - name: Install and configure RustDesk remote desktop
+      - name: Install and connect Tailscale
         shell: bash
         env:
-          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
+          TAILSCALE_AUTHKEY: \${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           set -Eeuo pipefail
 
-          if [[ -z "${RUSTDESK_PASSWORD:-}" ]]; then
-            echo "Missing repository secret: RUSTDESK_PASSWORD"
+          if [[ -z "\${TAILSCALE_AUTHKEY:-}" ]]; then
+            echo "Missing GitHub Secret: TAILSCALE_AUTHKEY"
+            exit 1
+          fi
+          echo "::add-mask::$TAILSCALE_AUTHKEY"
+
+          brew install tailscale
+          sudo brew services start tailscale
+
+          TS_BIN="$(command -v tailscale)"
+          READY=0
+          for attempt in $(seq 1 30); do
+            if sudo "$TS_BIN" status >/dev/null 2>&1; then
+              READY=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$READY" -ne 1 ]]; then
+            echo "tailscaled did not become ready."
+            sudo brew services list || true
+            exit 1
+          fi
+
+          sudo "$TS_BIN" up \
+            --auth-key="$TAILSCALE_AUTHKEY" \
+            --hostname="freemilk-mac-$GITHUB_RUN_ID" \
+            --accept-dns=false
+
+          TS_IP="$(sudo "$TS_BIN" ip -4 | head -n 1 | tr -d '\r\n')"
+          if [[ -z "$TS_IP" ]]; then
+            echo "Tailscale connected but did not return an IPv4 address."
+            sudo "$TS_BIN" status || true
+            exit 1
+          fi
+
+          echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
+          echo "Tailscale connected."
+          echo "Tailscale IPv4: $TS_IP"
+          sudo "$TS_BIN" status || true
+
+          {
+            echo "## Private Mac connection"
+            echo
+            echo "- **Tailscale IPv4:** \`$TS_IP\`"
+            echo "- **RustDesk Direct IP endpoint:** \`$TS_IP:21118\`"
+            echo "- **RustDesk password:** use the value in the repository secret \`RUSTDESK_PASSWORD\`"
+            echo
+            echo "Keep this workflow run active while connected."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install and configure RustDesk Direct IP
+        shell: bash
+        env:
+          RUSTDESK_PASSWORD: \${{ secrets.RUSTDESK_PASSWORD }}
+        run: |
+          set -Eeuo pipefail
+
+          if [[ -z "\${RUSTDESK_PASSWORD:-}" ]]; then
+            echo "Missing GitHub Secret: RUSTDESK_PASSWORD"
             exit 1
           fi
           echo "::add-mask::$RUSTDESK_PASSWORD"
 
-          # Pinned official RustDesk release for Apple Silicon.
           VERSION="1.5.3"
           DMG="$RUNNER_TEMP/rustdesk.dmg"
           MOUNT="$RUNNER_TEMP/rustdesk-mount"
           mkdir -p "$MOUNT"
 
           curl --fail --location --retry 3 --retry-delay 3 \
-            "https://github.com/rustdesk/rustdesk/releases/download/${VERSION}/rustdesk-${VERSION}-aarch64.dmg" \
+            "https://github.com/rustdesk/rustdesk/releases/download/$VERSION/rustdesk-$VERSION-aarch64.dmg" \
             --output "$DMG"
 
           hdiutil attach "$DMG" -readonly -nobrowse -quiet -mountpoint "$MOUNT"
           RD_APP_PATH="$(find "$MOUNT" -maxdepth 4 -type d -name 'RustDesk.app' -print -quit || true)"
+
           if [[ -z "$RD_APP_PATH" ]]; then
             echo "RustDesk.app was not found in its DMG."
             find "$MOUNT" -maxdepth 4 -print | head -80
@@ -119,44 +177,71 @@ jobs:
           sudo ditto "$RD_APP_PATH" /Applications/RustDesk.app
           hdiutil detach "$MOUNT" -quiet
 
+          # macOS RustDesk reads its user config from this Preferences directory.
+          RD_CONFIG_DIR="$HOME/Library/Preferences/com.carriez.RustDesk"
+          mkdir -p "$RD_CONFIG_DIR"
+
+          cat > "$RD_CONFIG_DIR/RustDesk2.toml" <<'TOML'
+          [options]
+          direct-server = 'Y'
+          direct-access-port = '21118'
+          TOML
+
           RD_BIN="/Applications/RustDesk.app/Contents/MacOS/rustdesk"
           if [[ ! -x "$RD_BIN" ]]; then
-            echo "RustDesk command-line executable was not found: $RD_BIN"
+            echo "RustDesk executable was not found: $RD_BIN"
             exit 1
           fi
 
-          # Start the app, set a permanent password, and obtain its ID.
+          # Allow incoming connections if the macOS application firewall is enabled.
+          FWCTL="/usr/libexec/ApplicationFirewall/socketfilterfw"
+          if [[ -x "$FWCTL" ]]; then
+            sudo "$FWCTL" --add /Applications/RustDesk.app || true
+            sudo "$FWCTL" --unblockapp /Applications/RustDesk.app || true
+          fi
+
           open -a /Applications/RustDesk.app || true
-          sleep 12
+          sleep 15
+
           sudo "$RD_BIN" --password "$RUSTDESK_PASSWORD" >/dev/null 2>&1
           sleep 5
 
           RD_ID="$("$RD_BIN" --get-id 2>/dev/null | tr -d '\r\n' || true)"
-          if [[ -z "$RD_ID" ]]; then
-            echo "RustDesk did not return an ID. Check the job log and runner connectivity."
-            exit 1
+          echo "RustDesk ID: \${RD_ID:-not-returned}"
+          echo "Direct IP mode configured on port 21118."
+
+          LISTENING=0
+          for attempt in $(seq 1 20); do
+            if sudo lsof -nP -iTCP:21118 -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
+              LISTENING=1
+              break
+            fi
+            sleep 2
+          done
+
+          if [[ "$LISTENING" -eq 1 ]]; then
+            echo "RustDesk Direct IP listener is active on TCP 21118."
+          else
+            echo "WARNING: RustDesk is not listening on TCP 21118 yet."
+            echo "RustDesk logs and macOS screen/input permissions may need inspection."
+            sudo lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | head -40 || true
           fi
 
-          echo "RUSTDESK_ID=$RD_ID" >> "$GITHUB_ENV"
           {
-            echo "## Remote Mac connection"
             echo
-            echo "- **RustDesk ID:** $RD_ID"
-            echo "- **Password:** use the value saved as the repository secret RUSTDESK_PASSWORD"
-            echo "- **Client:** install RustDesk on Windows and connect using this ID and password."
+            echo "### RustDesk status"
             echo
-            echo "> Keep this workflow run open while connected. The runner is temporary."
+            echo "- RustDesk device ID: \`\${RD_ID:-not returned}\`"
+            echo "- Direct IP port: TCP 21118"
+            echo "- Listener detected: $LISTENING"
           } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "RustDesk ID: $RD_ID"
-          echo "Password is stored in GitHub Secrets and is not printed."
 
       - name: Launch FreeMilk
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [[ -z "${FREEMILK_APP_PATH:-}" || ! -d "$FREEMILK_APP_PATH" ]]; then
-            echo "FreeMilk app bundle path is missing."
+          if [[ -z "\${FREEMILK_APP_PATH:-}" || ! -d "$FREEMILK_APP_PATH" ]]; then
+            echo "FreeMilk application path is missing."
             exit 1
           fi
           echo "Launching: $FREEMILK_APP_PATH"
@@ -165,14 +250,21 @@ jobs:
           pgrep -afil 'FreeMilk|Milq' || true
           echo "FreeMilk launch command completed."
 
-      - name: Keep the temporary Mac session alive
+      - name: Keep the temporary session alive
         shell: bash
         env:
-          SESSION_HOURS: ${{ inputs.session_hours }}
+          SESSION_HOURS: \${{ inputs.session_hours }}
         run: |
           set -Eeuo pipefail
           TOTAL_MINUTES=$((SESSION_HOURS * 60))
           for ((minute = 1; minute <= TOTAL_MINUTES; minute++)); do
             sleep 60
-            echo "Mac session active: ${minute}/${TOTAL_MINUTES} minutes"
+            echo "Session active: $minute/$TOTAL_MINUTES minutes"
           done
+
+      - name: Disconnect Tailscale
+        if: always()
+        shell: bash
+        run: |
+          sudo tailscale logout || true
+          sudo brew services stop tailscale || true
