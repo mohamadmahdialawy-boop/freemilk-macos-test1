@@ -86,7 +86,7 @@ jobs:
       - name: Install and connect Tailscale
         shell: bash
         env:
-          TAILSCALE_AUTHKEY: \${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
           set -Eeuo pipefail
 
@@ -145,7 +145,7 @@ jobs:
       - name: Install and configure RustDesk Direct IP
         shell: bash
         env:
-          RUSTDESK_PASSWORD: \${{ secrets.RUSTDESK_PASSWORD }}
+          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
         run: |
           set -Eeuo pipefail
 
@@ -253,7 +253,7 @@ jobs:
       - name: Keep the temporary session alive
         shell: bash
         env:
-          SESSION_HOURS: \${{ inputs.session_hours }}
+          SESSION_HOURS: ${{ inputs.session_hours }}
         run: |
           set -Eeuo pipefail
           TOTAL_MINUTES=$((SESSION_HOURS * 60))
