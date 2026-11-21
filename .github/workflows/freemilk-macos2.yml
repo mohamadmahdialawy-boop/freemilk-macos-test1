@@ -90,19 +90,22 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          if [[ -z "\${TAILSCALE_AUTHKEY:-}" ]]; then
+          if [[ -z "${TAILSCALE_AUTHKEY:-}" ]]; then
             echo "Missing GitHub Secret: TAILSCALE_AUTHKEY"
             exit 1
           fi
           echo "::add-mask::$TAILSCALE_AUTHKEY"
 
+          echo "Installing Tailscale..."
           brew install tailscale
+
+          echo "Starting the Tailscale system service..."
           sudo brew services start tailscale
 
-          TS_BIN="$(command -v tailscale)"
+          TS_BIN="$(brew --prefix tailscale)/bin/tailscale"
           READY=0
           for attempt in $(seq 1 30); do
-            if sudo "$TS_BIN" status >/dev/null 2>&1; then
+            if pgrep -x tailscaled >/dev/null 2>&1; then
               READY=1
               break
             fi
@@ -110,25 +113,32 @@ jobs:
           done
 
           if [[ "$READY" -ne 1 ]]; then
-            echo "tailscaled did not become ready."
-            sudo brew services list || true
+            echo "tailscaled process did not start."
+            sudo brew services info tailscale || true
+            sudo launchctl print system/sh.brew.tailscale 2>&1 | tail -80 || true
+            ps aux | grep '[t]ailscaled' || true
             exit 1
           fi
 
+          echo "tailscaled process is running; now authenticating this Mac..."
           sudo "$TS_BIN" up \
             --auth-key="$TAILSCALE_AUTHKEY" \
             --hostname="freemilk-mac-$GITHUB_RUN_ID" \
             --accept-dns=false
 
+          echo "Waiting for Tailscale network readiness..."
+          sudo "$TS_BIN" wait --timeout=90s
+
           TS_IP="$(sudo "$TS_BIN" ip -4 | head -n 1 | tr -d '\r\n')"
           if [[ -z "$TS_IP" ]]; then
             echo "Tailscale connected but did not return an IPv4 address."
             sudo "$TS_BIN" status || true
+            sudo "$TS_BIN" debug daemon-logs 2>&1 | tail -100 || true
             exit 1
           fi
 
           echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
-          echo "Tailscale connected."
+          echo "Tailscale connected successfully."
           echo "Tailscale IPv4: $TS_IP"
           sudo "$TS_BIN" status || true
 
@@ -149,7 +159,7 @@ jobs:
         run: |
           set -Eeuo pipefail
 
-          if [[ -z "\${RUSTDESK_PASSWORD:-}" ]]; then
+          if [[ -z "${RUSTDESK_PASSWORD:-}" ]]; then
             echo "Missing GitHub Secret: RUSTDESK_PASSWORD"
             exit 1
           fi
@@ -207,7 +217,7 @@ jobs:
           sleep 5
 
           RD_ID="$("$RD_BIN" --get-id 2>/dev/null | tr -d '\r\n' || true)"
-          echo "RustDesk ID: \${RD_ID:-not-returned}"
+          echo "RustDesk ID: ${RD_ID:-not-returned}"
           echo "Direct IP mode configured on port 21118."
 
           LISTENING=0
@@ -231,7 +241,7 @@ jobs:
             echo
             echo "### RustDesk status"
             echo
-            echo "- RustDesk device ID: \`\${RD_ID:-not returned}\`"
+            echo "- RustDesk device ID: \`${RD_ID:-not returned}\`"
             echo "- Direct IP port: TCP 21118"
             echo "- Listener detected: $LISTENING"
           } >> "$GITHUB_STEP_SUMMARY"
@@ -240,7 +250,7 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [[ -z "\${FREEMILK_APP_PATH:-}" || ! -d "$FREEMILK_APP_PATH" ]]; then
+          if [[ -z "${FREEMILK_APP_PATH:-}" || ! -d "$FREEMILK_APP_PATH" ]]; then
             echo "FreeMilk application path is missing."
             exit 1
           fi
