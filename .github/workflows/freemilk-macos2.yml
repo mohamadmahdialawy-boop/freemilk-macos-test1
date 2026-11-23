@@ -1,6 +1,9 @@
 name: FreeMilk macOS Development Session
 
 on:
+  push:
+    paths:
+      - ".github/run-macos-session-20261124"
   workflow_dispatch:
     inputs:
       session_hours:
@@ -382,7 +385,7 @@ jobs:
       - name: Keep the development session alive
         shell: bash
         env:
-          SESSION_HOURS: ${{ inputs.session_hours }}
+          SESSION_HOURS: ${{ inputs.session_hours || '3' }}
         run: |
           set -Eeuo pipefail
           TOTAL_MINUTES=$((SESSION_HOURS * 60))
