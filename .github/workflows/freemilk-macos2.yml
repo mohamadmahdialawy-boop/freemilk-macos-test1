@@ -209,6 +209,14 @@ jobs:
             echo "- **RustDesk Direct IP endpoint:** \`$TS_IP:21118\`"
             echo "- **RustDesk password:** the value you configured in repository secret \`RUSTDESK_PASSWORD\`"
             echo
+            echo "### Connect from Android"
+            echo
+            echo "1. Install Tailscale on the phone and sign in to the same Tailscale account."
+            echo "2. Install RustDesk from F-Droid or the official GitHub releases."
+            echo "3. In RustDesk, enter the Tailscale IPv4 address with port 21118: \`$TS_IP:21118\`."
+            echo "4. Enter the password configured in repository secret \`RUSTDESK_PASSWORD\`."
+            echo "5. Use Mouse mode or Touch mode and the on-screen keyboard."
+            echo
             echo "Keep this workflow run active while connected."
           } >> "$GITHUB_STEP_SUMMARY"
 
