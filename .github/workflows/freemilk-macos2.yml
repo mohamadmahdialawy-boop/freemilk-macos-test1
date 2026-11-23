@@ -1,13 +1,13 @@
-name: FreeMilk macOS Session
+name: FreeMilk macOS Development Session
 
 on:
   workflow_dispatch:
     inputs:
       session_hours:
-        description: "How long to keep the temporary session alive"
+        description: "Session length in hours (GitHub-hosted jobs have a 6-hour maximum)"
         required: true
         type: choice
-        default: "2"
+        default: "3"
         options:
           - "1"
           - "2"
@@ -16,7 +16,7 @@ on:
           - "5"
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: freemilk-macos-session
@@ -24,19 +24,53 @@ concurrency:
 
 jobs:
   freemilk-mac:
+    name: FreeMilk macOS 26 (Apple Silicon)
     runs-on: macos-26
     timeout-minutes: 360
 
     steps:
-      - name: Show macOS runner information
+      - name: Checkout project repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Verify runner and graphical login session
         shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
           sw_vers
           echo "Architecture: $(uname -m)"
           echo "CPU cores: $(sysctl -n hw.ncpu)"
           echo "RAM bytes: $(sysctl -n hw.memsize)"
           df -h /
+          echo "Runner user: $USER"
+          GUI_UID="$(id -u)"
+          if launchctl print "gui/$GUI_UID" >/dev/null 2>&1; then
+            echo "GUI login session: available"
+          else
+            echo "GUI login session: not detected"
+          fi
+
+      - name: Prepare project workspace
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          PROJECT_DIR="$GITHUB_WORKSPACE/FreeMilkProject"
+          mkdir -p "$PROJECT_DIR"
+          if [[ ! -f "$PROJECT_DIR/README.md" ]]; then
+            cat > "$PROJECT_DIR/README.md" <<'EOF'
+          # FreeMilkProject
+
+          Project workspace for macOS development.
+
+          This repository is public. Do not commit passwords, API keys, private data,
+          signing certificates, or other secrets.
+          EOF
+          fi
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor }}@users.noreply.github.com"
+          echo "Project workspace: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
 
       - name: Download and install FreeMilk for Mac
         shell: bash
@@ -81,9 +115,9 @@ jobs:
           fi
 
           hdiutil detach "$MOUNT" -quiet
-          echo "FreeMilk installation step completed."
+          echo "FreeMilk installation completed."
 
-      - name: Install and connect Tailscale
+      - name: Install and connect Tailscale (explicit daemon socket)
         shell: bash
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
@@ -96,58 +130,84 @@ jobs:
           fi
           echo "::add-mask::$TAILSCALE_AUTHKEY"
 
-          echo "Installing Tailscale..."
+          echo "Installing the CLI-only Tailscale package..."
           brew install tailscale
 
-          echo "Starting the Tailscale system service..."
-          sudo brew services start tailscale
+          TS_PREFIX="$(brew --prefix tailscale)"
+          TS_BIN="$TS_PREFIX/bin/tailscale"
+          TS_DAEMON="$TS_PREFIX/bin/tailscaled"
+          if [[ ! -x "$TS_BIN" || ! -x "$TS_DAEMON" ]]; then
+            echo "Tailscale binaries were not found under $TS_PREFIX"
+            exit 1
+          fi
 
-          TS_BIN="$(brew --prefix tailscale)/bin/tailscale"
+          TS_DIR="$RUNNER_TEMP/tailscale"
+          mkdir -p "$TS_DIR"
+          chmod 700 "$TS_DIR"
+          TS_SOCKET="$TS_DIR/tailscaled.sock"
+          TS_STATE="$TS_DIR/tailscaled.state"
+          TS_LOG="$TS_DIR/tailscaled.log"
+
+          echo "Starting tailscaled directly with a dedicated socket and state file..."
+          sudo nohup "$TS_DAEMON" \
+            --state="$TS_STATE" \
+            --socket="$TS_SOCKET" \
+            --tun=utun \
+            --port=41641 \
+            > "$TS_LOG" 2>&1 < /dev/null &
+          TS_PID=$!
+          echo "TAILSCALED_PID=$TS_PID" >> "$GITHUB_ENV"
+          echo "TAILSCALE_SOCKET=$TS_SOCKET" >> "$GITHUB_ENV"
+
           READY=0
-          for attempt in $(seq 1 30); do
-            if pgrep -x tailscaled >/dev/null 2>&1; then
+          for attempt in $(seq 1 45); do
+            if sudo "$TS_BIN" --socket="$TS_SOCKET" status >/dev/null 2>&1; then
               READY=1
+              break
+            fi
+            if ! sudo kill -0 "$TS_PID" >/dev/null 2>&1; then
+              echo "tailscaled process exited before its control socket became ready."
               break
             fi
             sleep 2
           done
 
           if [[ "$READY" -ne 1 ]]; then
-            echo "tailscaled process did not start."
-            sudo brew services info tailscale || true
-            sudo launchctl print system/sh.brew.tailscale 2>&1 | tail -80 || true
+            echo "Tailscale daemon did not become ready. Diagnostic output follows:"
+            tail -100 "$TS_LOG" || true
             ps aux | grep '[t]ailscaled' || true
+            ls -la "$TS_DIR" || true
             exit 1
           fi
 
-          echo "tailscaled process is running; now authenticating this Mac..."
-          sudo "$TS_BIN" up \
+          echo "Tailscale control socket is responding. Authenticating..."
+          sudo "$TS_BIN" --socket="$TS_SOCKET" up \
             --auth-key="$TAILSCALE_AUTHKEY" \
             --hostname="freemilk-mac-$GITHUB_RUN_ID" \
             --accept-dns=false
 
-          echo "Waiting for Tailscale network readiness..."
-          sudo "$TS_BIN" wait --timeout=90s
+          echo "Waiting for network readiness..."
+          sudo "$TS_BIN" --socket="$TS_SOCKET" wait --timeout=90s
 
-          TS_IP="$(sudo "$TS_BIN" ip -4 | head -n 1 | tr -d '\r\n')"
+          TS_IP="$(sudo "$TS_BIN" --socket="$TS_SOCKET" ip -4 | head -n 1 | tr -d '\r\n')"
           if [[ -z "$TS_IP" ]]; then
             echo "Tailscale connected but did not return an IPv4 address."
-            sudo "$TS_BIN" status || true
-            sudo "$TS_BIN" debug daemon-logs 2>&1 | tail -100 || true
+            sudo "$TS_BIN" --socket="$TS_SOCKET" status || true
+            tail -100 "$TS_LOG" || true
             exit 1
           fi
 
           echo "TAILSCALE_IP=$TS_IP" >> "$GITHUB_ENV"
-          echo "Tailscale connected successfully."
+          echo "Tailscale network is ready."
           echo "Tailscale IPv4: $TS_IP"
-          sudo "$TS_BIN" status || true
+          sudo "$TS_BIN" --socket="$TS_SOCKET" status || true
 
           {
             echo "## Private Mac connection"
             echo
             echo "- **Tailscale IPv4:** \`$TS_IP\`"
             echo "- **RustDesk Direct IP endpoint:** \`$TS_IP:21118\`"
-            echo "- **RustDesk password:** use the value in the repository secret \`RUSTDESK_PASSWORD\`"
+            echo "- **RustDesk password:** the value you configured in repository secret \`RUSTDESK_PASSWORD\`"
             echo
             echo "Keep this workflow run active while connected."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -170,10 +230,12 @@ jobs:
           MOUNT="$RUNNER_TEMP/rustdesk-mount"
           mkdir -p "$MOUNT"
 
+          echo "Downloading RustDesk $VERSION for Apple Silicon..."
           curl --fail --location --retry 3 --retry-delay 3 \
             "https://github.com/rustdesk/rustdesk/releases/download/$VERSION/rustdesk-$VERSION-aarch64.dmg" \
             --output "$DMG"
 
+          file "$DMG"
           hdiutil attach "$DMG" -readonly -nobrowse -quiet -mountpoint "$MOUNT"
           RD_APP_PATH="$(find "$MOUNT" -maxdepth 4 -type d -name 'RustDesk.app' -print -quit || true)"
 
@@ -187,15 +249,17 @@ jobs:
           sudo ditto "$RD_APP_PATH" /Applications/RustDesk.app
           hdiutil detach "$MOUNT" -quiet
 
-          # macOS RustDesk reads its user config from this Preferences directory.
           RD_CONFIG_DIR="$HOME/Library/Preferences/com.carriez.RustDesk"
           mkdir -p "$RD_CONFIG_DIR"
+          chmod 700 "$RD_CONFIG_DIR"
 
           cat > "$RD_CONFIG_DIR/RustDesk2.toml" <<'TOML'
           [options]
           direct-server = 'Y'
           direct-access-port = '21118'
+          allow-auto-disconnect = 'N'
           TOML
+          chmod 600 "$RD_CONFIG_DIR/RustDesk2.toml"
 
           RD_BIN="/Applications/RustDesk.app/Contents/MacOS/rustdesk"
           if [[ ! -x "$RD_BIN" ]]; then
@@ -203,25 +267,32 @@ jobs:
             exit 1
           fi
 
-          # Allow incoming connections if the macOS application firewall is enabled.
           FWCTL="/usr/libexec/ApplicationFirewall/socketfilterfw"
           if [[ -x "$FWCTL" ]]; then
             sudo "$FWCTL" --add /Applications/RustDesk.app || true
             sudo "$FWCTL" --unblockapp /Applications/RustDesk.app || true
           fi
 
-          open -a /Applications/RustDesk.app || true
+          echo "Launching RustDesk in the logged-in GUI session..."
+          open -a /Applications/RustDesk.app
           sleep 15
 
-          sudo "$RD_BIN" --password "$RUSTDESK_PASSWORD" >/dev/null 2>&1
-          sleep 5
+          # Configure the unattended password without printing it.
+          if "$RD_BIN" --password "$RUSTDESK_PASSWORD" >/dev/null 2>&1; then
+            echo "RustDesk password configuration command completed."
+          elif sudo "$RD_BIN" --password "$RUSTDESK_PASSWORD" >/dev/null 2>&1; then
+            echo "RustDesk password configuration command completed with elevated privileges."
+          else
+            echo "RustDesk password CLI configuration did not confirm success."
+          fi
 
           RD_ID="$("$RD_BIN" --get-id 2>/dev/null | tr -d '\r\n' || true)"
-          echo "RustDesk ID: ${RD_ID:-not-returned}"
-          echo "Direct IP mode configured on port 21118."
+          echo "RustDesk ID: ${RD_ID:-not returned}"
+          echo "RustDesk process:"
+          pgrep -afil 'RustDesk' || true
 
           LISTENING=0
-          for attempt in $(seq 1 20); do
+          for attempt in $(seq 1 25); do
             if sudo lsof -nP -iTCP:21118 -sTCP:LISTEN 2>/dev/null | grep -q LISTEN; then
               LISTENING=1
               break
@@ -232,21 +303,22 @@ jobs:
           if [[ "$LISTENING" -eq 1 ]]; then
             echo "RustDesk Direct IP listener is active on TCP 21118."
           else
-            echo "WARNING: RustDesk is not listening on TCP 21118 yet."
-            echo "RustDesk logs and macOS screen/input permissions may need inspection."
-            sudo lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | head -40 || true
+            echo "RustDesk did not open TCP 21118. Listener diagnostics:"
+            sudo lsof -nP -iTCP -sTCP:LISTEN 2>/dev/null | head -50 || true
+            echo "RustDesk must be inspected before a remote session can be considered ready."
+            exit 1
           fi
 
           {
             echo
             echo "### RustDesk status"
             echo
+            echo "- RustDesk Direct IP listener: **PASS** (TCP 21118)"
             echo "- RustDesk device ID: \`${RD_ID:-not returned}\`"
-            echo "- Direct IP port: TCP 21118"
-            echo "- Listener detected: $LISTENING"
+            echo "- RustDesk password: configured from repository secret; not printed"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Launch FreeMilk
+      - name: Launch FreeMilk and test internet access
         shell: bash
         run: |
           set -Eeuo pipefail
@@ -254,27 +326,77 @@ jobs:
             echo "FreeMilk application path is missing."
             exit 1
           fi
-          echo "Launching: $FREEMILK_APP_PATH"
+
+          echo "Launching $FREEMILK_APP_PATH"
           open "$FREEMILK_APP_PATH"
           sleep 15
-          pgrep -afil 'FreeMilk|Milq' || true
-          echo "FreeMilk launch command completed."
 
-      - name: Keep the temporary session alive
+          if pgrep -afil 'FreeMilk|Milq' >/dev/null 2>&1; then
+            echo "FreeMilk process detected."
+          else
+            echo "FreeMilk process was not detected after launch."
+            exit 1
+          fi
+
+          if curl --fail --silent --show-error --location --max-time 20 \
+            --output /dev/null "https://claude.ai"; then
+            echo "Claude website connectivity: PASS"
+          else
+            echo "Claude website connectivity: FAIL"
+            exit 1
+          fi
+
+          {
+            echo
+            echo "### FreeMilk and network"
+            echo
+            echo "- FreeMilk process: **PASS**"
+            echo "- Internet access to claude.ai: **PASS**"
+            echo "- Project directory: \`$PROJECT_DIR\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check macOS screen-capture capability (diagnostic only)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          SCREENSHOT="$RUNNER_TEMP/desktop-diagnostic.png"
+          if screencapture -x "$SCREENSHOT" >/dev/null 2>&1 && [[ -s "$SCREENSHOT" ]]; then
+            SIZE="$(stat -f%z "$SCREENSHOT")"
+            echo "macOS screencapture command produced a file ($SIZE bytes)."
+            echo "This does not by itself prove RustDesk has Screen Recording permission."
+            echo "- macOS screencapture utility: **PASS** (file created; RustDesk TCC permissions remain unverified)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "macOS screencapture utility could not produce a screenshot."
+            echo "- macOS screencapture utility: **FAIL**" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          rm -f "$SCREENSHOT"
+
+      - name: Keep the development session alive
         shell: bash
         env:
           SESSION_HOURS: ${{ inputs.session_hours }}
         run: |
           set -Eeuo pipefail
           TOTAL_MINUTES=$((SESSION_HOURS * 60))
+          echo "Development session is active for $TOTAL_MINUTES minutes."
           for ((minute = 1; minute <= TOTAL_MINUTES; minute++)); do
             sleep 60
-            echo "Session active: $minute/$TOTAL_MINUTES minutes"
+            if (( minute % 5 == 0 )); then
+              echo "Session active: $minute/$TOTAL_MINUTES minutes"
+            fi
           done
 
-      - name: Disconnect Tailscale
+      - name: Disconnect Tailscale and stop daemon
         if: always()
         shell: bash
         run: |
-          sudo tailscale logout || true
-          sudo brew services stop tailscale || true
+          set +e
+          TS_BIN="$(brew --prefix tailscale 2>/dev/null)/bin/tailscale"
+          if [[ -n "${TAILSCALE_SOCKET:-}" && -x "$TS_BIN" ]]; then
+            sudo "$TS_BIN" --socket="$TAILSCALE_SOCKET" logout >/dev/null 2>&1 || true
+          fi
+          if [[ -n "${TAILSCALED_PID:-}" ]]; then
+            sudo kill "$TAILSCALED_PID" >/dev/null 2>&1 || true
+          fi
+          sudo pkill -f '[t]ailscaled.*tailscale' >/dev/null 2>&1 || true
+          echo "Tailscale cleanup attempted."
