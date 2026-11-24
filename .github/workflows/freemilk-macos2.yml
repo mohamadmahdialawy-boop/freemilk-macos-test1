@@ -164,13 +164,20 @@ jobs:
 
           READY=0
           for attempt in $(seq 1 45); do
-            if sudo "$TS_BIN" --socket="$TS_SOCKET" status >/dev/null 2>&1; then
+            # Before authentication, tailscale status normally prints "Logged out."
+            # and exits non-zero. That response proves the daemon's LocalAPI is ready.
+            STATUS_OUTPUT="$(sudo "$TS_BIN" --socket="$TS_SOCKET" status 2>&1 || true)"
+            if [[ "$STATUS_OUTPUT" == *"Logged out."* ]] || [[ "$STATUS_OUTPUT" == *"BackendState"* ]]; then
               READY=1
+              echo "Tailscale LocalAPI is responding; pre-authentication state is expected."
               break
             fi
             if ! sudo kill -0 "$TS_PID" >/dev/null 2>&1; then
               echo "tailscaled process exited before its control socket became ready."
               break
+            fi
+            if (( attempt % 10 == 0 )); then
+              echo "Waiting for Tailscale LocalAPI ($attempt/45): ${STATUS_OUTPUT:-no response}"
             fi
             sleep 2
           done
