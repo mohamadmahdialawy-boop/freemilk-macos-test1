@@ -1,3 +1,4 @@
 start_requested=true
 session_hours=3
+retry=2
 purpose=interactive development and testing of my own macOS project
